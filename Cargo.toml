@@ -12,5 +12,5 @@ Timer facilities for Tokio
 """
 
 [dependencies]
-futures = "0.1"
+futures = { git = "https://github.com/rust-lang-nursery/futures-rs.git" }
 slab = "0.3.0"

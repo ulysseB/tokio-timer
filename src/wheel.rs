@@ -1,5 +1,5 @@
 use {Builder};
-use futures::task::Task;
+use futures::task::Waker;
 use slab::Slab;
 use std::{cmp, mem, usize};
 use std::time::{Instant, Duration};
@@ -61,7 +61,7 @@ enum Entry {
 }
 
 struct Timeout {
-    task: Task,
+    waker: Waker,
     when: Instant,
     wheel_idx: usize,
     prev: Token,
@@ -124,7 +124,7 @@ impl Wheel {
         self.slab.remove(token);
     }
 
-    pub fn set_timeout(&mut self, token: Token, mut at: Instant, task: Task) {
+    pub fn set_timeout(&mut self, token: Token, mut at: Instant, waker: Waker) {
         // First up, figure out where we're gonna go in the wheel. Note that if
         // we're being scheduled on or before the current wheel tick we just
         // make sure to defer ourselves to the next tick.
@@ -148,7 +148,7 @@ impl Wheel {
 
         {
             self.slab[token] = Entry::Timeout(Timeout {
-                task: task,
+                waker: waker,
                 when: at,
                 wheel_idx: wheel_idx,
                 prev: EMPTY,
@@ -180,7 +180,7 @@ impl Wheel {
     ///
     /// This method will panic if `at` is before the instant that this timer
     /// wheel was created.
-    pub fn poll(&mut self, at: Instant) -> Option<Task> {
+    pub fn poll(&mut self, at: Instant) -> Option<Waker> {
         let wheel_tick = self.time_to_ticks(at);
 
         // Advance forward in time to the `wheel_tick` specified.
@@ -221,7 +221,7 @@ impl Wheel {
             if self.time_to_ticks(head_timeout) <= self.time_to_ticks(at) {
                 let task = match self.remove_slab(head) {
                     Some(Entry::Timeout(v)) => {
-                        Some(v.task)
+                        Some(v.waker)
                     }
                     _ => None,
                 };
@@ -255,10 +255,10 @@ impl Wheel {
         min.map(|t| *t)
     }
 
-    pub fn move_timeout(&mut self, token: Token, when: Instant, task: Task) {
+    pub fn move_timeout(&mut self, token: Token, when: Instant, waker: Waker) {
         match self.slab.get_mut(token) {
             Some(&mut Entry::Timeout(ref mut e)) if e.when == when => {
-                e.task = task;
+                e.waker = waker;
             }
             _ => {}
         }

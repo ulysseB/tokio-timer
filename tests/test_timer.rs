@@ -4,8 +4,9 @@ extern crate tokio_timer as timer;
 mod support;
 
 // use futures::*;
-use futures::{Future, Stream, Sink, Async};
-use futures::sync::{oneshot, mpsc};
+use futures::prelude::*;
+use futures::channel::{oneshot, mpsc};
+use futures::executor::block_on;
 use timer::*;
 use std::io;
 use std::time::*;
@@ -16,7 +17,8 @@ fn test_immediate_sleep() {
     let timer = Timer::default();
 
     let mut t = timer.sleep(Duration::from_millis(0));
-    assert_eq!(Async::Ready(()), t.poll().unwrap());
+    let cx = unsafe{ std::mem::transmute(&mut ()) };
+    assert_eq!(Async::Ready(()), t.poll(cx).unwrap());
 }
 
 #[test]
@@ -26,9 +28,7 @@ fn test_delayed_sleep() {
 
     for _ in 0..20 {
         let elapsed = support::time(|| {
-            timer.sleep(dur)
-                .wait()
-                .unwrap();
+            block_on(timer.sleep(dur)).unwrap();
         });
 
         elapsed.assert_is_about(dur);
@@ -46,11 +46,11 @@ fn test_setting_later_sleep_then_earlier_one() {
     let to2 = timer.sleep(dur2);
 
     let t1 = thread::spawn(move || {
-        support::time(|| to1.wait().unwrap())
+        support::time(|| block_on(to1).unwrap())
     });
 
     let t2 = thread::spawn(move || {
-        support::time(|| to2.wait().unwrap())
+        support::time(|| block_on(to2).unwrap())
     });
 
     t1.join().unwrap().assert_is_about(dur1);
@@ -70,8 +70,8 @@ fn test_timer_with_looping_wheel() {
     let to1 = timer.sleep(dur1);
     let to2 = timer.sleep(dur2);
 
-    let e1 = support::time(|| to1.wait().unwrap());
-    let e2 = support::time(|| to2.wait().unwrap());
+    let e1 = support::time(|| block_on(to1).unwrap());
+    let e2 = support::time(|| block_on(to2).unwrap());
 
     e1.assert_is_about(dur1);
     e2.assert_is_about(Duration::from_millis(800));
@@ -84,10 +84,10 @@ fn test_request_sleep_greater_than_max() {
         .build();
 
     let to = timer.sleep(Duration::from_millis(600));
-    assert!(to.wait().is_err());
+    assert!(block_on(to).is_err());
 
     let to = timer.sleep(Duration::from_millis(500));
-    assert!(to.wait().is_ok());
+    assert!(block_on(to).is_ok());
 }
 
 #[test]
@@ -111,7 +111,7 @@ fn test_timeout_with_future_completes_first() {
         tx.send(Ok::<&'static str, io::Error>("done")).expect("send");
     });
 
-    assert_eq!("done", to.wait().unwrap());
+    assert_eq!("done", block_on(to).unwrap());
 }
 
 #[test]
@@ -130,7 +130,7 @@ fn test_timeout_with_timeout_completes_first() {
 
     let to = timer.timeout(rx, dur);
 
-    let err: io::Error = to.wait().unwrap_err();
+    let err: io::Error = block_on(to).unwrap_err();
     assert_eq!(io::ErrorKind::TimedOut, err.kind());
 }
 
@@ -156,7 +156,7 @@ fn test_timeout_with_future_errors_first() {
         tx.send(Err::<&'static str, io::Error>(err)).expect("send");
     });
 
-    let err = to.wait().unwrap_err();
+    let err = block_on(to).unwrap_err();
 
     assert_eq!(io::ErrorKind::NotFound, err.kind());
 }
@@ -179,13 +179,15 @@ fn test_timeout_stream_with_stream_completes_first() {
 
     thread::spawn(move || {
         thread::sleep(Duration::from_millis(100));
-        let tx = tx.send(Ok::<&'static str, io::Error>("one")).wait().unwrap();
+        let f = tx.send(Ok::<&'static str, io::Error>("one"));
+        let tx = block_on(f).unwrap();
 
         thread::sleep(Duration::from_millis(100));
-        tx.send(Ok::<&'static str, io::Error>("two")).wait().unwrap();
+        let f = tx.send(Ok::<&'static str, io::Error>("two"));
+        block_on(f).unwrap();
     });
 
-    let mut s = to.wait();
+    let mut s = block_on(to);
 
     assert_eq!("one", s.next().unwrap().unwrap());
     assert_eq!("two", s.next().unwrap().unwrap());
@@ -210,17 +212,19 @@ fn test_timeout_stream_with_timeout_completes_first() {
 
     thread::spawn(move || {
         thread::sleep(Duration::from_millis(100));
-        let tx = tx.send(Ok::<&'static str, io::Error>("one")).wait().unwrap();
+        let f = tx.send(Ok::<&'static str, io::Error>("one"));
+        let tx = block_on(f).unwrap();
 
         thread::sleep(Duration::from_millis(100));
-        let tx = tx.send(Ok::<&'static str, io::Error>("two")).wait().unwrap();
+        let f = tx.send(Ok::<&'static str, io::Error>("two"));
+        let tx = block_on(f).unwrap();
 
         thread::sleep(Duration::from_millis(600));
 
         drop(tx);
     });
 
-    let mut s = to.wait();
+    let mut s = block_on(to);
 
     assert_eq!("one", s.next().unwrap().unwrap());
     assert_eq!("two", s.next().unwrap().unwrap());

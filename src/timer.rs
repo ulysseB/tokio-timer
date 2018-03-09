@@ -1,9 +1,9 @@
-use {interval, Interval, Builder, wheel};
+use {interval, wheel, Builder, Interval};
 use worker::Worker;
 use wheel::{Token, Wheel};
 
-use futures::{Future, Stream, Async, Poll};
-use futures::task::{self, Task};
+use futures::{Async, Future, Poll, Stream};
+use futures::task::{self, Waker};
 
 use std::{fmt, io};
 use std::error::Error;
@@ -21,7 +21,7 @@ pub struct Timer {
 pub struct Sleep {
     timer: Timer,
     when: Instant,
-    handle: Option<(Task, Token)>,
+    handle: Option<(Waker, Token)>,
 }
 
 /// Allows a given `Future` to execute for a max duration
@@ -83,8 +83,9 @@ impl Timer {
     /// future will complete with that result. If `duration` expires, the
     /// `Timeout` future completes with a `TimeoutError`.
     pub fn timeout<F, E>(&self, future: F, duration: Duration) -> Timeout<F>
-        where F: Future<Error = E>,
-              E: From<TimeoutError<F>>,
+    where
+        F: Future<Error = E>,
+        E: From<TimeoutError<F>>,
     {
         Timeout {
             future: Some(future),
@@ -99,8 +100,9 @@ impl Timer {
     /// value is returned and the timeout is reset for the next value. If the
     /// `duration` expires, then the stream will error with a `TimeoutError`.
     pub fn timeout_stream<T, E>(&self, stream: T, duration: Duration) -> TimeoutStream<T>
-        where T: Stream<Error = E>,
-              E: From<TimeoutError<T>>,
+    where
+        T: Stream<Error = E>,
+        E: From<TimeoutError<T>>,
     {
         TimeoutStream {
             stream: Some(stream),
@@ -190,7 +192,7 @@ impl Future for Sleep {
     type Item = ();
     type Error = TimerError;
 
-    fn poll(&mut self) -> Poll<(), TimerError> {
+    fn poll(&mut self, cx: &mut task::Context) -> Poll<(), TimerError> {
         if self.is_expired() {
             return Ok(Async::Ready(()));
         }
@@ -208,37 +210,38 @@ impl Future for Sleep {
                     return Err(TimerError::TooLong);
                 }
 
-                // Get the current task handle
-                let task = task::current();
+                // Get the current waker
+                let waker = cx.waker();
 
-                match self.timer.worker.set_timeout(self.when, task.clone()) {
-                    Ok(token) => {
-                        (task, token)
-                    }
-                    Err(task) => {
+                match self.timer.worker.set_timeout(self.when, waker.clone()) {
+                    Ok(token) => (waker, token),
+                    Err(waker) => {
                         // The timer is overloaded, yield the current task
-                        task.notify();
-                        return Ok(Async::NotReady);
+                        waker.wake();
+                        return Ok(Async::Pending);
                     }
                 }
             }
-            Some((ref task, token)) => {
-                if task.will_notify_current() {
+            Some((ref waker, token)) => {
+                if waker.will_wake(&cx.waker()) {
                     // Nothing more to do, the notify on timeout has already
                     // been registered
-                    return Ok(Async::NotReady);
+                    return Ok(Async::Pending);
                 }
 
-                let task = task::current();
+                let waker = cx.waker();
 
                 // The timeout has been moved to another task, in this case the
                 // timer has to be notified
-                match self.timer.worker.move_timeout(token, self.when, task.clone()) {
-                    Ok(_) => (task, token),
-                    Err(task) => {
+                match self.timer
+                    .worker
+                    .move_timeout(token, self.when, waker.clone())
+                {
+                    Ok(_) => (waker, token),
+                    Err(waker) => {
                         // Overloaded timer, yield hte current task
-                        task.notify();
-                        return Ok(Async::NotReady);
+                        waker.wake();
+                        return Ok(Async::Pending);
                     }
                 }
             }
@@ -247,7 +250,7 @@ impl Future for Sleep {
         // Moved out here to make the borrow checker happy
         self.handle = Some(handle);
 
-        Ok(Async::NotReady)
+        Ok(Async::Pending)
     }
 }
 
@@ -272,7 +275,9 @@ impl<T> Timeout<T> {
     ///
     /// This function panics if the underlying future has already been consumed.
     pub fn get_ref(&self) -> &T {
-        self.future.as_ref().expect("the future has already been consumed")
+        self.future
+            .as_ref()
+            .expect("the future has already been consumed")
     }
 
     /// Gets a mutable reference to the underlying future in this timeout.
@@ -281,7 +286,9 @@ impl<T> Timeout<T> {
     ///
     /// This function panics if the underlying future has already been consumed.
     pub fn get_mut(&mut self) -> &mut T {
-        self.future.as_mut().expect("the future has already been consumed")
+        self.future
+            .as_mut()
+            .expect("the future has already been consumed")
     }
 
     /// Consumes this timeout, returning the underlying future.
@@ -295,27 +302,26 @@ impl<T> Timeout<T> {
 }
 
 impl<F, E> Future for Timeout<F>
-    where F: Future<Error = E>,
-          E: From<TimeoutError<F>>,
+where
+    F: Future<Error = E>,
+    E: From<TimeoutError<F>>,
 {
     type Item = F::Item;
     type Error = E;
 
-    fn poll(&mut self) -> Poll<F::Item, E> {
+    fn poll(&mut self, cx: &mut task::Context) -> Poll<F::Item, E> {
         // First, try polling the future
         match self.future {
-            Some(ref mut f) => {
-                match f.poll() {
-                    Ok(Async::NotReady) => {}
-                    v => return v,
-                }
-            }
+            Some(ref mut f) => match f.poll(cx) {
+                Ok(Async::Pending) => {}
+                v => return v,
+            },
             None => panic!("cannot call poll once value is consumed"),
         }
 
         // Now check the timer
-        match self.sleep.poll() {
-            Ok(Async::NotReady) => Ok(Async::NotReady),
+        match self.sleep.poll(cx) {
+            Ok(Async::Pending) => Ok(Async::Pending),
             Ok(Async::Ready(_)) => {
                 // Timeout has elapsed, error the future
                 let f = self.future.take().unwrap();
@@ -343,7 +349,9 @@ impl<T> TimeoutStream<T> {
     ///
     /// This function panics if the underlying stream has already been consumed.
     pub fn get_ref(&self) -> &T {
-        self.stream.as_ref().expect("the stream has already been consumed")
+        self.stream
+            .as_ref()
+            .expect("the stream has already been consumed")
     }
 
     /// Gets a mutable reference to the underlying stream in this timeout.
@@ -352,7 +360,9 @@ impl<T> TimeoutStream<T> {
     ///
     /// This function panics if the underlying stream has already been consumed.
     pub fn get_mut(&mut self) -> &mut T {
-        self.stream.as_mut().expect("the stream has already been consumed")
+        self.stream
+            .as_mut()
+            .expect("the stream has already been consumed")
     }
 
     /// Consumes this timeout, returning the underlying stream.
@@ -366,18 +376,19 @@ impl<T> TimeoutStream<T> {
 }
 
 impl<T, E> Stream for TimeoutStream<T>
-    where T: Stream<Error = E>,
-          E: From<TimeoutError<T>>,
+where
+    T: Stream<Error = E>,
+    E: From<TimeoutError<T>>,
 {
     type Item = T::Item;
     type Error = E;
 
-    fn poll(&mut self) -> Poll<Option<T::Item>, E> {
+    fn poll_next(&mut self, cx: &mut task::Context) -> Poll<Option<T::Item>, E> {
         // First, try polling the future
         match self.stream {
             Some(ref mut s) => {
-                match s.poll() {
-                    Ok(Async::NotReady) => {}
+                match s.poll_next(cx) {
+                    Ok(Async::Pending) => {}
                     Ok(Async::Ready(Some(v))) => {
                         // Reset the timeout
                         self.sleep = Sleep::new(self.sleep.timer.clone(), self.duration);
@@ -392,8 +403,8 @@ impl<T, E> Stream for TimeoutStream<T>
         }
 
         // Now check the timer
-        match self.sleep.poll() {
-            Ok(Async::NotReady) => Ok(Async::NotReady),
+        match self.sleep.poll(cx) {
+            Ok(Async::Pending) => Ok(Async::Pending),
             Ok(Async::Ready(_)) => {
                 // Timeout has elapsed, error the future
                 let s = self.stream.take().unwrap();
@@ -460,7 +471,9 @@ impl<T> From<TimeoutError<T>> for io::Error {
         use self::TimeoutError::*;
 
         match src {
-            Timer(_, TooLong) => io::Error::new(io::ErrorKind::InvalidInput, "requested timeout too long"),
+            Timer(_, TooLong) => {
+                io::Error::new(io::ErrorKind::InvalidInput, "requested timeout too long")
+            }
             Timer(_, NoCapacity) => io::Error::new(io::ErrorKind::Other, "timer out of capacity"),
             TimedOut(_) => io::Error::new(io::ErrorKind::TimedOut, "the future timed out"),
         }
@@ -474,11 +487,9 @@ impl From<TimerError> for io::Error {
 }
 
 impl From<TimerError> for () {
-    fn from(_: TimerError) -> () {
-    }
+    fn from(_: TimerError) -> () {}
 }
 
 impl<T> From<TimeoutError<T>> for () {
-    fn from(_: TimeoutError<T>) -> () {
-    }
+    fn from(_: TimeoutError<T>) -> () {}
 }

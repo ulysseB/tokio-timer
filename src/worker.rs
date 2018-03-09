@@ -4,7 +4,7 @@
 use Builder;
 use mpmc::Queue;
 use wheel::{Token, Wheel};
-use futures::task::Task;
+use futures::task::Waker;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -30,11 +30,11 @@ struct Chan {
 }
 
 /// Messages sent on the `set_timeouts` exchange
-struct SetTimeout(Instant, Task);
+struct SetTimeout(Instant, Waker);
 
 /// Messages sent on the `mod_timeouts` queue
 enum ModTimeout {
-    Move(Token, Instant, Task),
+    Move(Token, Instant, Waker),
     Cancel(Token, Instant),
 }
 
@@ -85,26 +85,26 @@ impl Worker {
     }
 
     /// Set a timeout
-    pub fn set_timeout(&self, when: Instant, task: Task) -> Result<Token, Task> {
-        self.tx.chan.set_timeouts.push(SetTimeout(when, task))
+    pub fn set_timeout(&self, when: Instant, waker: Waker) -> Result<Token, Waker> {
+        self.tx.chan.set_timeouts.push(SetTimeout(when, waker))
             .and_then(|ret| {
                 // Unpark the timer thread
                 self.tx.worker.unpark();
                 Ok(ret)
             })
-            .map_err(|SetTimeout(_, task)| task)
+            .map_err(|SetTimeout(_, waker)| waker)
     }
 
     /// Move a timeout
-    pub fn move_timeout(&self, token: Token, when: Instant, task: Task) -> Result<(), Task> {
-        self.tx.chan.mod_timeouts.push(ModTimeout::Move(token, when, task))
+    pub fn move_timeout(&self, token: Token, when: Instant, waker: Waker) -> Result<(), Waker> {
+        self.tx.chan.mod_timeouts.push(ModTimeout::Move(token, when, waker))
             .and_then(|ret| {
                 self.tx.worker.unpark();
                 Ok(ret)
             })
             .map_err(|v| {
                 match v {
-                    ModTimeout::Move(_, _, task) => task,
+                    ModTimeout::Move(_, _, waker) => waker,
                     _ => unreachable!(),
                 }
             })
@@ -129,16 +129,16 @@ fn run(chan: Arc<Chan>, mut wheel: Wheel) {
         let now = Instant::now();
 
         // Fire off all expired timeouts
-        while let Some(task) = wheel.poll(now) {
-            task.notify();
+        while let Some(waker) = wheel.poll(now) {
+            waker.wake();
         }
 
         // As long as the wheel has capacity to manage new timeouts, read off
         // of the queue.
         while let Some(token) = wheel.reserve() {
             match chan.set_timeouts.pop(token) {
-                Ok((SetTimeout(when, task), token)) => {
-                    wheel.set_timeout(token, when, task);
+                Ok((SetTimeout(when, waker), token)) => {
+                    wheel.set_timeout(token, when, waker);
                 }
                 Err(token) => {
                     wheel.release(token);
@@ -149,8 +149,8 @@ fn run(chan: Arc<Chan>, mut wheel: Wheel) {
 
         loop {
             match chan.mod_timeouts.pop(()) {
-                Ok((ModTimeout::Move(token, when, task), _)) => {
-                    wheel.move_timeout(token, when, task);
+                Ok((ModTimeout::Move(token, when, waker), _)) => {
+                    wheel.move_timeout(token, when, waker);
                 }
                 Ok((ModTimeout::Cancel(token, when), _)) => {
                     wheel.cancel(token, when);

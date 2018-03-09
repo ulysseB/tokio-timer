@@ -1,4 +1,4 @@
-use futures::{Future, Stream, Async, Poll};
+use futures::{Future, Stream, Async, Poll, task};
 
 use {Sleep, TimerError};
 
@@ -25,8 +25,8 @@ impl Stream for Interval {
     type Item = ();
     type Error = TimerError;
 
-    fn poll(&mut self) -> Poll<Option<()>, TimerError> {
-        let _ = try_ready!(self.sleep.poll());
+    fn poll_next(&mut self, cx: &mut task::Context) -> Poll<Option<()>, TimerError> {
+        let _ = try_ready!(self.sleep.poll(cx));
 
         // Reset the timeout
         self.sleep = self.sleep.timer().sleep(self.duration);
