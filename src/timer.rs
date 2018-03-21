@@ -211,7 +211,7 @@ impl Future for Sleep {
                 }
 
                 // Get the current waker
-                let waker = cx.waker();
+                let waker = cx.waker().clone();
 
                 match self.timer.worker.set_timeout(self.when, waker.clone()) {
                     Ok(token) => (waker, token),
@@ -229,7 +229,7 @@ impl Future for Sleep {
                     return Ok(Async::Pending);
                 }
 
-                let waker = cx.waker();
+                let waker = cx.waker().clone();
 
                 // The timeout has been moved to another task, in this case the
                 // timer has to be notified

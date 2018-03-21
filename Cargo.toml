@@ -11,5 +11,5 @@ Timer facilities for Tokio
 """
 
 [dependencies]
-futures = "0.2.0-alpha"
+futures = "0.2.0-beta"
 slab = "0.3.0"
